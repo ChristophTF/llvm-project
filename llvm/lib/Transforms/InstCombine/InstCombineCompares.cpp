@@ -6527,6 +6527,70 @@ static Instruction *foldFabsWithFcmpZero(FCmpInst &I, InstCombinerImpl &IC) {
   }
 }
 
+static APFloat calcAddPrimeAP(const APFloat& a, const APFloat& c)
+{
+  // Calculate c' such that forall x . x + a < c <=> x < c'
+  APFloat testVal = c - a;
+
+  if((testVal + a).compare(c) == APFloatBase::cmpResult::cmpLessThan)
+  {
+    do
+    {
+      testVal.next(false);
+    }
+    while((testVal + a).compare(c) == APFloatBase::cmpResult::cmpLessThan);
+
+    return testVal;
+  }
+  else
+  {
+    do
+    {
+      testVal.next(true);
+    }
+    while((testVal + a).compare(c) != APFloatBase::cmpResult::cmpLessThan);
+
+    testVal.next(false);
+  }
+
+  return testVal;
+}
+
+bool foldAddConstCompareConst(FCmpInst &cmpi, const Constant* cmpConst, Value* additionOperand, const APFloat& a, const APFloat& c)
+{
+  Constant* cPrimeConst;
+
+  switch(cmpi.getPredicate())
+  {
+    default:
+      return false;
+    
+    case CmpInst::Predicate::FCMP_OGE:
+    case CmpInst::Predicate::FCMP_OLT:
+    case CmpInst::Predicate::FCMP_UGE:
+    case CmpInst::Predicate::FCMP_ULT:
+      cPrimeConst = ConstantFP::get(cmpConst->getType(), calcAddPrimeAP(a, c));
+      break;
+    
+    case CmpInst::Predicate::FCMP_OGT:
+    case CmpInst::Predicate::FCMP_OLE:
+    case CmpInst::Predicate::FCMP_UGT:
+    case CmpInst::Predicate::FCMP_ULE:
+    {
+      APFloat cInc = c;
+      cInc.next(false);
+      APFloat res = calcAddPrimeAP(a, cInc);
+      res.next(true);
+      cPrimeConst = ConstantFP::get(cmpConst->getType(), res);
+      break;
+    }
+  }
+
+  cmpi.setOperand(0, additionOperand);
+  cmpi.setOperand(1, cPrimeConst);
+  return true;
+}
+
 Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {
   bool Changed = false;
 
@@ -6634,7 +6698,22 @@ Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {
                   cast<LoadInst>(LHSI), GEP, GV, I))
             return Res;
       break;
-  }
+    case Instruction::FAdd:
+      if(ConstantFP* cmpConst = dyn_cast<ConstantFP>(RHSC))
+        if(BinaryOperator* addition = dyn_cast<BinaryOperator>(LHSI))
+          if(ConstantFP* addConst = dyn_cast<ConstantFP>(addition->getOperand(1)))
+          {
+            const APFloat& a = addConst->getValueAPF();
+            const APFloat& c = cmpConst->getValueAPF();
+
+            if(a.isFinite() && c.isFinite())
+            {
+              if(foldAddConstCompareConst(I, cmpConst, addition->getOperand(0), a, c))
+                return &I;
+            }
+          }
+      break;
+    }
   }
 
   if (Instruction *R = foldFabsWithFcmpZero(I, *this))
@@ -6698,6 +6777,9 @@ Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {
   if (I.getType()->isVectorTy())
     if (Instruction *Res = foldVectorCmp(I, Builder))
       return Res;
+
+  // x + a < c <=> x < c' for some c' ~ (c - a) if Finite(a) && Finite(c)
+
 
   return Changed ? &I : nullptr;
 }
